@@ -4,3 +4,9 @@ node_modules/
 dist/
 .ds_store
 coverage/
+
+# next.js
+/.next/
+/out/
+next-env.d.ts
+*.tsbuildinfo
