@@ -4,6 +4,7 @@
 > **Autor:** Principal Software Architect
 > **Stack:** Next.js (App Router) · TypeScript (strict) · PostgreSQL · Prisma · KMS
 > **Alcance:** publicación multi-red (X / Twitter API v2, LinkedIn API, Meta Graph API — Facebook Pages)
+**Plan de trabajo:** el desglose en tickets, con estado y rol asignado, vive en [`PLANNING.md`](./PLANNING.md)
 
 ---
 
@@ -11,6 +12,7 @@
 
 1. [Principios y decisiones de arquitectura](#1-principios-y-decisiones-de-arquitectura)
 2. [Estrategia de autenticación OAuth 2.0](#2-estrategia-de-autenticación-oauth-20)
+   - [2.7 Apartado de configuración — Ajustes → Conexiones](#27-apartado-de-configuración--ajustes--conexiones)
 3. [Esquema de datos y custodia de tokens](#3-esquema-de-datos-y-custodia-de-tokens)
 4. [Contrato del endpoint `POST /api/v1/posts/publish`](#4-contrato-del-endpoint-post-apiv1postspublish)
 5. [Modelo de errores](#5-modelo-de-errores)
@@ -307,6 +309,196 @@ const appsecretProof = createHmac('sha256', env.META_APP_SECRET)
 | Firma extra por request | — | Headers de versión | **`appsecret_proof`** |
 | Límite de texto | 280 (ponderado) | 3.000 | 63.206 |
 | Idempotencia nativa | No | No | No |
+
+### 2.7 Apartado de configuración — `Ajustes → Conexiones`
+
+Es la **única superficie donde el usuario gestiona sus conexiones sociales**: conectar, ver el estado, reconectar y desconectar. Todo lo descrito en §2.3–§2.5 (PKCE, rotación de tokens, Page Tokens) queda oculto tras esta pantalla; el usuario solo ve cuentas y estados.
+
+#### 2.7.1 Ubicación y estructura
+
+```
+/settings
+   ├── /settings/profile        Datos de la cuenta de Posty
+   ├── /settings/connections    ← este apartado
+   ├── /settings/notifications  Avisos de caducidad y de publicación fallida
+   └── /settings/account        Plan, API keys, borrado de cuenta
+```
+
+El shell de `/settings` es un layout con navegación lateral persistente. `/settings/connections` es un **Server Component** que consulta las conexiones en el servidor: los datos llegan al navegador ya filtrados, sin pasar por un endpoint público y sin posibilidad de que un token viaje en el payload de hidratación.
+
+#### 2.7.2 Modelo de la pantalla
+
+Una **tarjeta por conexión**, agrupada por red. Una red puede tener 0, 1 o N conexiones (N es lo normal en Facebook: una por Página; el modelo de datos lo permite también en X y LinkedIn, ver `@@unique([userId, network, externalAccountId])` en §3.3).
+
+```
+┌─ Ajustes ─────────────────────────────────────────────────────────────┐
+│ Perfil                                                                 │
+│ Conexiones  ●        ⚠ 2 conexiones necesitan tu atención             │
+│ Notificaciones                                                         │
+│ Cuenta                                                                 │
+└────────────────────────────────────────────────────────────────────────┘
+
+  𝕏  X (Twitter)
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ ◯ @posty_app                                            [ ⋯ ]    │
+  │   Conectada · última publicación hace 2 h                        │
+  │   ✅ Renovación automática activa                                 │
+  └──────────────────────────────────────────────────────────────────┘
+  + Conectar otra cuenta de X
+
+  in  LinkedIn
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ ◯ Emanuel Fernández                                     [ ⋯ ]    │
+  │   ⚠ Caduca el 6 de noviembre de 2026 (en 5 días)                 │
+  │   LinkedIn exige volver a autorizar cada 60 días.                │
+  │                                            [ Reconectar ]        │
+  └──────────────────────────────────────────────────────────────────┘
+
+  f  Facebook (Páginas)
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ ◯ Posty HQ                                              [ ⋯ ]    │
+  │   ✕ Requiere reconexión                                          │
+  │   El acceso se revocó en Facebook. No se publicará en esta       │
+  │   Página hasta que vuelvas a conectarla.        [ Reconectar ]   │
+  ├──────────────────────────────────────────────────────────────────┤
+  │ ◯ Herdr Store                                           [ ⋯ ]    │
+  │   Conectada · sin publicaciones todavía                          │
+  └──────────────────────────────────────────────────────────────────┘
+  + Añadir otra Página
+```
+
+Menú `[ ⋯ ]` por tarjeta: **Probar conexión** · **Reconectar** · **Ver permisos concedidos** · **Desconectar** (destructivo, en rojo y separado).
+
+#### 2.7.3 Estados de la tarjeta
+
+Mapeo directo desde `ConnectionStatus` (§3.6). **La UI no calcula estados**: los recibe resueltos del servidor, que es quien conoce `expiresAt` y la capacidad de auto-renovación.
+
+| Estado | Origen | Qué ve el usuario | Acción principal |
+|---|---|---|---|
+| **Conectada** | `ACTIVE` con renovación automática | "Conectada" + última publicación | — |
+| **Caduca pronto** | `EXPIRING` (< 7 días, sin `refresh_token`) | Fecha de caducidad y por qué ocurre | `Reconectar` |
+| **Requiere reconexión** | `REAUTH_REQUIRED` | Motivo en lenguaje llano; aviso de que no se publicará | `Reconectar` (destacada) |
+| **No conectada** | Sin fila para esa red | Descripción de lo que permite hacer + permisos que se pedirán | `Conectar` |
+| **Verificando** | Transitorio de `POST /verify` | Spinner en la tarjeta, resto operativo | — |
+
+**Regla de comunicación:** el usuario nunca lee `REAUTH_REQUIRED`, `invalid_grant` ni `OAuthException 190`. Lee *"El acceso se revocó en Facebook"*. El código técnico va en `data-error-code` para soporte y telemetría, no en el texto visible.
+
+#### 2.7.4 Acciones y endpoints
+
+| Acción | Origen en UI | Endpoint | Comportamiento |
+|---|---|---|---|
+| Listar | Carga del Server Component | `GET /api/v1/connections` | Devuelve `ConnectionDTO[]` (§2.7.5). El SC llama al servicio directamente; el endpoint existe para la API pública |
+| Conectar | `Conectar` / `Conectar otra cuenta` | `GET /api/auth/{network}/connect?returnTo=/settings/connections` | Genera `state` + PKCE (§2.2) y redirige al proveedor |
+| Reconectar | `Reconectar` | `GET /api/auth/{network}/connect?connectionId={id}` | **Preserva el `connectionId`**: el callback hace *upsert* sobre la fila existente. Los `PublicationTarget` históricos mantienen su referencia y el historial no se rompe |
+| Elegir Página | Tras el callback de Meta | `GET /api/auth/facebook/pages` (sesión de conexión en curso) | Lista las Páginas administradas; el usuario marca las que quiere. Una conexión por Página |
+| Probar | `Probar conexión` | `POST /api/v1/connections/{id}/verify` | Llamada de coste mínimo al proveedor (`GET /2/users/me`, `/v2/userinfo`, `/{page-id}?fields=id`). Actualiza `status` y devuelve el resultado |
+| Ver permisos | `Ver permisos concedidos` | — (dato ya en el DTO) | Traduce los `scopes` a frases: `w_member_social` → "Publicar en tu nombre" |
+| Desconectar | `Desconectar` | `DELETE /api/v1/connections/{id}` | Revoca en el proveedor y **después** borra los tokens localmente. Si la revocación remota falla, se borra igual y se registra en `AuditLog` (§7.3) |
+
+**Confirmación de desconexión** — modal explícito, porque la acción no es reversible sin volver a pasar por OAuth:
+
+```
+  Desconectar «Posty HQ» de Facebook
+
+  · Posty dejará de publicar en esta Página.
+  · Se eliminarán las credenciales guardadas.
+  · Las publicaciones ya realizadas seguirán en Facebook.
+  · Podrás volver a conectarla cuando quieras.
+
+  Hay 1 publicación programada que usa esta conexión y se cancelará.
+
+                              [ Cancelar ]  [ Desconectar ]
+```
+
+La advertencia sobre publicaciones programadas se calcula en el servidor consultando `PublicationTarget` con `status = PENDING` y publicación `scheduledAt > now`.
+
+#### 2.7.5 `ConnectionDTO` — el contrato de la pantalla
+
+```ts
+// lib/api/v1/schemas/connection.ts
+export interface ConnectionDTO {
+  id: string;
+  network: 'twitter' | 'linkedin' | 'facebook';
+
+  account: {
+    id: string;                 // id externo (no sensible)
+    name: string;               // "Posty HQ" · "Emanuel Fernández"
+    handle: string | null;      // "@posty_app"
+    avatarUrl: string | null;
+    profileUrl: string | null;
+  };
+
+  status: 'active' | 'expiring' | 'reauth_required' | 'revoked';
+
+  /** Frase lista para mostrar, ya localizada. La UI no interpreta códigos. */
+  statusMessage: string;
+
+  /** Código técnico para soporte y telemetría. No se muestra como texto. */
+  statusCode: string | null;
+
+  /** true si el sistema puede renovar solo (X siempre; LinkedIn solo si hay refresh token). */
+  canAutoRenew: boolean;
+
+  /** Solo se expone cuando importa al usuario (canAutoRenew === false). */
+  expiresAt: string | null;
+
+  /** Scopes traducidos a lenguaje natural, en el orden en que se muestran. */
+  permissions: Array<{ scope: string; label: string }>;
+
+  connectedAt: string;
+  lastUsedAt: string | null;
+
+  actions: {
+    canReconnect: boolean;
+    canDisconnect: boolean;
+    reconnectUrl: string;       // /api/auth/{network}/connect?connectionId=...
+  };
+}
+```
+
+> **Invariante verificada por test de contrato:** `JSON.stringify(dto)` no contiene ninguna de las claves `accessToken`, `refreshToken`, `ciphertext`, `keyVersion`, `codeVerifier`, ni ningún valor que coincida con el patrón de un token de los tres proveedores. El test corre sobre la respuesta serializada real, no sobre el tipo.
+
+#### 2.7.6 Vuelta del callback
+
+El callback OAuth redirige a `/settings/connections` con parámetros de resultado, que la página traduce en una notificación y **limpia de la URL** (`history.replaceState`) para que un refresco no vuelva a mostrarla:
+
+| Parámetro | Notificación |
+|---|---|
+| `?connected=twitter` | ✅ "Cuenta de X conectada correctamente." |
+| `?reconnected=facebook` | ✅ "Conexión con Facebook restablecida." |
+| `?error=access_denied` | ℹ️ "Has cancelado la autorización. No se ha conectado nada." |
+| `?error=state_expired` | ⚠️ "La sesión de conexión ha caducado. Vuelve a intentarlo." |
+| `?error=insufficient_scope` | ⚠️ "Faltan permisos: Posty necesita permiso para publicar. Vuelve a conectar y acepta todos los permisos." |
+| `?error=provider_error` | ⚠️ "{Red} ha rechazado la conexión. Inténtalo de nuevo en unos minutos." |
+
+`access_denied` es una **cancelación del usuario, no un error**: se comunica en tono neutro y sin marcar la pantalla en rojo.
+
+#### 2.7.7 Estado vacío
+
+Cuando no hay ninguna conexión, la pantalla no muestra una lista vacía sino las tres redes disponibles con lo que aporta cada una y los permisos que se solicitarán antes de iniciar el flujo — el consentimiento informado empieza antes del `redirect`, no en la pantalla del proveedor:
+
+```
+  Conecta tu primera red
+
+  𝕏  X (Twitter)    Publicar tweets de hasta 280 caracteres.
+                    Permisos: leer tu perfil · publicar en tu nombre.   [ Conectar ]
+
+  in  LinkedIn      Publicar en tu feed personal, hasta 3.000 caracteres.
+                    Permisos: leer tu perfil · publicar en tu nombre.   [ Conectar ]
+
+  f   Facebook      Publicar en las Páginas que administras.
+                    Permisos: ver tus Páginas · publicar en ellas.      [ Conectar ]
+```
+
+#### 2.7.8 Reglas transversales
+
+- **Sin tokens en el cliente, nunca.** La pantalla es Server Component; los Client Components reciben solo `ConnectionDTO`.
+- **CSRF:** `DELETE` y `POST /verify` se invocan desde Server Actions o con verificación de `Origin`; `SameSite=Lax` no protege por sí solo peticiones iniciadas desde otra pestaña del mismo sitio.
+- **Rate limit** en `connect` y `verify`: 10 intentos / 10 min por usuario. Evita usar `verify` como sonda de disponibilidad de las APIs de terceros.
+- **Autorización por recurso:** un `connectionId` de otro usuario devuelve `404`, nunca `403` (no se confirma la existencia de recursos ajenos, §5.2).
+- **Auditoría:** `connection.created`, `connection.reconnected`, `connection.verified`, `connection.revoked` se escriben en `AuditLog` con IP y user agent.
+- **Accesibilidad:** el estado de cada tarjeta se anuncia por texto además de por color e icono (nunca solo color); las notificaciones del callback usan `aria-live="polite"`; el modal de desconexión atrapa el foco y se cierra con `Esc`.
+- **Actualización en vivo:** tras `verify` o `reconnect`, `revalidatePath('/settings/connections')` refresca los datos del servidor sin recarga completa.
 
 ---
 
@@ -955,7 +1147,8 @@ worker publish.target(targetId)
 | `GET` | `/api/v1/posts` | Historial paginado (cursor-based) |
 | `DELETE` | `/api/v1/posts/{id}` | Cancela una publicación programada aún no ejecutada (`409` si ya salió) |
 | `POST` | `/api/v1/posts/{id}/retry` | Reintenta solo los targets en `failed` y `retryable` |
-| `GET` | `/api/v1/connections` | Conexiones del usuario, con `status` y `expiresAt` (sin tokens) |
+| `GET` | `/api/v1/connections` | Conexiones del usuario como `ConnectionDTO[]` ([§2.7.5](#275-connectiondto--el-contrato-de-la-pantalla)), sin tokens |
+| `POST` | `/api/v1/connections/{id}/verify` | Comprueba la conexión contra el proveedor y actualiza su `status` |
 | `DELETE` | `/api/v1/connections/{id}` | Revoca en el proveedor y borra los tokens locales |
 
 ### 4.7 OpenAPI (fragmento normativo)
